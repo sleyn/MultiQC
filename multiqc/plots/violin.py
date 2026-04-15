@@ -66,6 +66,10 @@ class ViolinPlotInputData(NormalizedPlotInputData[TableConfig]):
                 for row in group_rows:
                     # Process each metric/column in the order from get_headers_in_order()
                     for section_order, metric_name, dt_column in ordered_headers:
+                        # Skip metrics that don't belong to the current section
+                        if section_order != section_idx:
+                            continue
+
                         if metric_name not in row.data:
                             continue
 

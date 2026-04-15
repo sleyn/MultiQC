@@ -6,9 +6,12 @@ existing reports with new data.
 
 import json
 import logging
+import inspect
+from functools import lru_cache
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union, cast
+from importlib import import_module
 
 import packaging.version
 import polars as pl
@@ -163,6 +166,7 @@ class LoadMultiqcData(BaseMultiqcModule):
                     # Extract module data first so we can use it for section defaults
                     anchor = mod_dict.get("anchor", "")
                     name = mod_dict.get("name", "")
+                    mod_id = mod_dict.get("mod_id", "")
                     info = mod_dict.get("info", "")
                     intro = mod_dict.get("intro", "")
                     comment = mod_dict.get("comment", "")
@@ -225,6 +229,15 @@ class LoadMultiqcData(BaseMultiqcModule):
                     mod.intro = intro
                     mod.comment = comment
 
+                    # Register CSS and JS sections in module if they exist
+                    if mod_id:
+                        html_assets = self.register_module_assets(mod_id)
+                        if html_assets is not None:
+                            log.debug(f"Add CSS to {mod_id}: {html_assets['css']}")
+                            mod.css.update(html_assets["css"])
+                            log.debug(f"Add JS to {mod_id}: {html_assets['js']}")
+                            mod.js.update(html_assets["js"])
+
                     # Check for duplicate modules and merge if found (same logic as exec_modules.py)
                     existing_mod = None
                     for prev_mod in report.modules:
@@ -236,12 +249,21 @@ class LoadMultiqcData(BaseMultiqcModule):
                         # Merge the existing module into the new one
                         mod.merge(existing_mod)  # This only merges versions
 
+                        # Look up a custom parquet handler once per module (result is cached)
+                        parquet_handler = LoadMultiqcData._get_module_parquet_handler(mod_id) if mod_id else None
+                        logging.debug(f"Found custom parquet handler for {mod_id}: {parquet_handler}")
+                        custom_merge_anchors: List[str] = (
+                            getattr(parquet_handler, "CUSTOM_MERGE_SECTION_ANCHORS", [])
+                            if parquet_handler is not None
+                            else []
+                        )
+
                         # Merge sections based on anchor - keep all unique sections from both modules
                         existing_sections = {s.anchor: s for s in existing_mod.sections}
                         new_sections = {s.anchor: s for s in mod.sections}
 
                         merged_sections = []
-                        all_section_anchors = set(existing_sections.keys()) | set(new_sections.keys())
+                        all_section_anchors = dict.fromkeys(list(new_sections.keys()) + list(existing_sections.keys()))
 
                         for section_anchor in all_section_anchors:
                             if section_anchor in existing_sections and section_anchor in new_sections:
@@ -264,15 +286,39 @@ class LoadMultiqcData(BaseMultiqcModule):
                                     # New section has data, existing section is empty - use new
                                     merged_sections.append(new_section)
                                 elif existing_has_data and new_has_data:
-                                    # Both sections have data - perform proper merging
-                                    # Combine content if it's different
-                                    merged_content = new_section.content
-                                    if existing_section.content and existing_section.content != new_section.content:
-                                        # If content is different, append existing content to new content
-                                        if merged_content:
-                                            merged_content = merged_content + "\n\n" + existing_section.content
-                                        else:
-                                            merged_content = existing_section.content
+                                    # Both sections have data - try a custom handler first, then
+                                    # fall back to the default concatenation strategy.
+                                    merged_content: Optional[str] = None
+
+                                    # Check whether the section anchor matches any custom anchor
+                                    # (substring match, as required by the convention)
+                                    section_anchor_str = str(section_anchor)
+                                    for custom_anchor in custom_merge_anchors:
+                                        if custom_anchor in section_anchor_str:
+                                            merge_fn = getattr(parquet_handler, "merge_section_content", None)
+                                            if (
+                                                merge_fn is not None
+                                                and existing_section.content
+                                                and new_section.content
+                                            ):
+                                                merged_content = merge_fn(existing_section.content, new_section.content)
+                                                if merged_content is not None:
+                                                    log.debug(
+                                                        "Used custom parquet merge for section '%s' "
+                                                        "(handler anchor key: '%s')",
+                                                        section_anchor_str,
+                                                        custom_anchor,
+                                                    )
+                                            break
+
+                                    if merged_content is None:
+                                        # Default merge: new content + existing content appended
+                                        merged_content = new_section.content
+                                        if existing_section.content and existing_section.content != new_section.content:
+                                            if merged_content:
+                                                merged_content = merged_content + "\n\n" + existing_section.content
+                                            else:
+                                                merged_content = existing_section.content
 
                                     # Preserve plot-related attributes from whichever section has them
                                     merged_plot_anchor = new_section.plot_anchor or existing_section.plot_anchor
@@ -432,3 +478,93 @@ class LoadMultiqcData(BaseMultiqcModule):
                 log.error(f"Error creating plot object for {anchor}: {e}")
                 if config.strict:
                     raise e
+
+    @staticmethod
+    def _resolve_module_from_entry_point(module_name: str):
+        entry_point = config.avail_modules.get(module_name)
+        if entry_point is None:
+            return None
+
+        try:
+            obj = entry_point.load()
+            mod = inspect.getmodule(obj)
+            if mod is not None:
+                return mod
+        except Exception:
+            log.debug("Failed to load entry point for %s", module_name, exc_info=True)
+
+        try:
+            module_path = entry_point.value.split(":", 1)[0]
+            return import_module(module_path)
+        except Exception:
+            log.debug("Failed to import entry point module for %s", module_name, exc_info=True)
+            return None
+
+    @staticmethod
+    def _get_entry_point_module_path(module_name: str) -> Optional[str]:
+        entry_point = config.avail_modules.get(module_name)
+        if entry_point is None:
+            return None
+
+        try:
+            return entry_point.value.split(":", 1)[0]
+        except Exception:
+            log.debug("Invalid entry point value for %s", module_name, exc_info=True)
+            return None
+
+    @staticmethod
+    @lru_cache(maxsize=128)
+    def _get_module_parquet_handler(module_name: str):
+        """Resolve optional parquet merge handler module for a MultiQC module.
+
+        Uses the module entry-point path. By convention, handlers live at
+        ``<module_path>.parquet_load``.
+        """
+        module_path = LoadMultiqcData._get_entry_point_module_path(module_name)
+        if not module_path:
+            return None
+
+        try:
+            return import_module(f"{module_path}.parquet_load")
+        except Exception:
+            # Most modules do not define custom parquet handlers, or handler module doesn't exist.
+            return None
+
+    @staticmethod
+    def register_module_assets(module_name: str):
+        """
+        Find and register static assets for a module without instantiating it.
+
+        The preferred resolution path uses the loaded MultiQC module entry points,
+        so this works for both built-in modules and external plugins.
+        """
+        mod = LoadMultiqcData._resolve_module_from_entry_point(module_name)
+
+        if mod is None:
+            log.debug("No importable module for %s; skipping assets", module_name)
+            return {"css": {}, "js": {}}
+
+        mod_file = getattr(mod, "__file__", None)
+        if mod_file is None:
+            log.debug("Module %s has no __file__; skipping assets", module_name)
+            return {"css": {}, "js": {}}
+
+        mod_dir = Path(mod_file).parent
+
+        assets_dir = mod_dir / "assets"
+        css_dir = assets_dir / "css"
+        js_dir = assets_dir / "js"
+
+        # These two dicts mirror what modules set in __init__()
+        css_map = {}
+        js_map = {}
+
+        if css_dir.exists():
+            for css in css_dir.glob("*.css"):
+                css_map[f"assets/css/{css.name}"] = str(css)
+
+        if js_dir.exists():
+            for js in js_dir.glob("*.js"):
+                js_map[f"assets/js/{js.name}"] = str(js)
+
+        return {"css": css_map, "js": js_map}
